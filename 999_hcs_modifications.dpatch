@@ -1,0 +1,2197 @@
+#! /bin/sh /usr/share/dpatch/dpatch-run
+## 999_hcs.dpatch by Vivek Sant <vsant@hcs.harvard.edu>
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: HCS changes to Mailman
+
+@DPATCH@
+
+diff -ru mailman-2.1.9.orig/bin/newlist mailman-2.1.9/bin/newlist
+--- mailman-2.1.9.orig/bin/newlist	2008-08-06 18:43:08.000000000 -0400
++++ mailman-2.1.9/bin/newlist	2008-08-06 19:00:29.000000000 -0400
+@@ -87,9 +87,6 @@
+ defined in your Defaults.py file or overridden by settings in mm_cfg.py).
+ 
+ Note that listnames are forced to lowercase.
+-
+-The list admin address need to be a fully-qualified address, like
+-owner@example.com, not just owner.
+ """
+ 
+ import sys
+@@ -97,7 +94,6 @@
+ import getpass
+ import getopt
+ import sha
+-import grp
+ 
+ import paths
+ from Mailman import mm_cfg
+@@ -111,6 +107,7 @@
+ 
+ PROGRAM = sys.argv[0]
+ 
++ERROR_LIST_EXISTS = 16
+ 
+ 
+ def usage(code, msg=''):
+@@ -126,9 +123,6 @@
+ 
+ 
+ def main():
+-    gid = grp.getgrnam(mm_cfg.MAILMAN_GROUP)[2]
+-    if os.getgid() != gid and gid not in os.getgroups():
+-        os.setgid(gid)
+     try:
+         opts, args = getopt.getopt(sys.argv[1:], 'hql:u:e:',
+                                    ['help', 'quiet', 'language=',
+@@ -174,7 +168,7 @@
+     web_page_url = mm_cfg.DEFAULT_URL_PATTERN % urlhost
+ 
+     if Utils.list_exists(listname):
+-        usage(1, _('List already exists: %(listname)s'))
++        usage(ERROR_LIST_EXISTS, _('List already exists: %(listname)s'))
+ 
+     if len(args) > 1:
+         owner_mail = args[1]
+@@ -206,9 +200,9 @@
+         except Errors.BadListNameError, s:
+             usage(1, _('Illegal list name: %(s)s'))
+         except Errors.EmailAddressError, s:
+-            usage(1, _('Bad owner email address: %(s)s.  Owner addresses need to be fully-qualified names, like "owner@example.com", not just "owner".'))
++            usage(1, _('Bad owner email address: %(s)s'))
+         except Errors.MMListAlreadyExistsError:
+-            usage(1, _('List already exists: %(listname)s'))
++            usage(ERROR_LIST_EXISTS, _('List already exists: %(listname)s'))
+ 
+         # Assign domain-specific attributes
+         mlist.host_name = host_name
+diff -ru mailman-2.1.9.orig/bin/rmlist mailman-2.1.9/bin/rmlist
+--- mailman-2.1.9.orig/bin/rmlist	2009-05-09 13:01:08.000000000 -0400
++++ mailman-2.1.9/bin/rmlist	2008-08-06 19:00:29.000000000 -0400
+@@ -41,6 +41,10 @@
+ import getopt
+ import shutil
+ 
++import time
++import fileinput
++import re
++
+ import paths
+ from Mailman import mm_cfg
+ from Mailman import Utils
+@@ -55,6 +59,40 @@
+ 
+ 
+ 
++LOCKFILE = '/nfs/transport/transport.lock'
++T_TABLE = '/nfs/transport/transport'
++def lock():
++  for i in xrange(100):
++    if os.path.exists(LOCKFILE):
++      time.sleep(.1)
++      sys.stderr.write('lock out..sleeping\n')
++    else:
++      open(LOCKFILE, 'w').close()
++      return
++  raise ValueError("Unable to obtain lock")
++
++
++
++def unlock():
++  os.unlink(LOCKFILE)
++
++
++
++def deleteLinesForList(file,search):
++  # Modify transport table in place
++  for line in fileinput.input(file, inplace=1):
++    # If line contains listname, check that it is actually an entry for that list,
++    # and not just another list with 'search' as its prefix
++    if search in line:
++      extensions = ['', '-admin', '-bounces', '-confirm', '-join', '-leave', '-owner', '-request', '-subscribe', '-unsubscribe']
++      for ext in extensions:
++        if re.search('^'+search+ext+'@',line):
++          line = ""
++          break
++    sys.stdout.write(line)
++
++
++
+ def usage(code, msg=''):
+     if code:
+         fd = sys.stderr
+@@ -120,6 +158,12 @@
+             __import__(modname)
+             sys.modules[modname].remove(mlist)
+ 
++        # Remove transport table entry
++        lock()
++        deleteLinesForList(T_TABLE,listname)
++        os.system('/usr/sbin/postmap %s' % T_TABLE)
++        unlock()
++
+         REMOVABLES = [
+             (os.path.join('lists', listname), _('list info')),
+             ]
+diff -ru mailman-2.1.9.orig/Mailman/Archiver/Archiver.py mailman-2.1.9/Archiver/Archiver/Archiver.py
+--- mailman-2.1.9.orig/Mailman/Archiver/Archiver.py	2006-02-28 21:34:10.000000000 -0500
++++ mailman-2.1.9/Mailman/Archiver/Archiver	2008-08-06 19:15:53.000000000 -0400
+@@ -35,6 +35,7 @@
+ from Mailman.SafeDict import SafeDict
+ from Mailman.Logging.Syslog import syslog
+ from Mailman.i18n import _
++from Mailman.htmlformat import *
+ 
+ try:
+     True, False
+@@ -121,6 +122,7 @@
+                     'emptyarchive.html',
+                     {'listname': self.real_name,
+                      'listinfo': self.GetScriptURL('listinfo', absolute=1),
++                     'HCSHeader': HCSHeader(),
+                      }, mlist=self))
+             if fp:
+                 fp.close()
+diff -ru mailman-2.1.9.orig/Mailman/Bouncers/BouncerAPI.py mailman-2.1.9/Mailman/Bouncers/BouncerAPI.py
+--- mailman-2.1.9.orig/Mailman/Bouncers/BouncerAPI.py	2006-02-28 21:34:10.000000000 -0500
++++ mailman-2.1.9/Mailman/Bouncers/BouncerAPI.py	2008-08-06 19:15:53.000000000 -0400
+@@ -37,6 +37,7 @@
+ 
+ 
+ BOUNCE_PIPELINE = [
++    'HCS',
+     'DSN',
+     'Qmail',
+     'Postfix',
+diff -Nru mailman-2.1.9.orig/Mailman/Bouncers/HCS.py mailman-2.1.9/Mailman/Bouncers/HCS.py
+--- mailman-2.1.9.orig/Mailman/Bouncers/HCS.py	1969-12-31 19:00:00.000000000 -0500
++++ mailman-2.1.9/Mailman/Bouncers/HCS.py	2008-08-06 19:15:53.000000000 -0400
+@@ -0,0 +1,31 @@
++# Copyright (C) 2006 by the Harvard Computer Society
++#
++# This program is free software; you can redistribute it and/or
++# modify it under the terms of the GNU General Public License
++# as published by the Free Software Foundation; either version 2
++# of the License, or (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++
++"""HASCS 550 Spam Bounce Rules"""
++
++import re
++import email.Iterators
++from Mailman.Bouncers.BouncerAPI import Stop
++
++spam_re1 = re.compile(r'http://www\.spamhaus\.org/query/bl')
++spam_re2 = re.compile(r'www\.fas\.harvard\.edu/computing/block')
++
++def process(msg):
++    for line in email.Iterators.body_line_iterator(msg):
++        if spam_re1.search(line):
++            return Stop
++        if spam_re2.search(line):
++            return Stop
+diff -ru mailman-2.1.9.orig/Mailman/Bouncers/SimpleMatch.py mailman-2.1.9/Mailman/Bouncers/SimpleMatch.py
+--- mailman-2.1.9.orig/Mailman/Bouncers/SimpleMatch.py	2006-04-04 19:23:17.000000000 -0400
++++ mailman-2.1.9/Mailman/Bouncers/SimpleMatch.py	2008-08-06 19:15:53.000000000 -0400
+@@ -1,4 +1,4 @@
+-# Copyright (C) 1998-2006 by the Free Software Foundation, Inc.
++# Copyright (C) 1998-2007 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+@@ -87,6 +87,10 @@
+     (_c('Unable to deliver message to the following address\(es\)\.'),
+      _c('--- Original message follows\.'),
+      _c('<(?P<addr>[^>]*)>:')),
++    # googlemail.com
++    (_c('Delivery to the following recipient failed'),
++     _c('----- Original message -----'),
++     _c('^\s*(?P<addr>[^\s@]+@[^\s@]+)\s*$')),
+     # kundenserver.de
+     (_c('A message that you sent could not be delivered'),
+      _c('^---'),
+@@ -97,13 +101,16 @@
+      _c('^(?P<addr>[^\s@]+@[^\s@:]+):')),
+     # thehartford.com
+     (_c('Delivery to the following recipients failed'),
+-     _c("Bogus - there actually isn't anything"),
++     # this one may or may not have the original message, but there's nothing
++     # unique to stop on, so stop on the first line of at least 3 characters
++     # that doesn't start with 'D' (to not stop immediately) and has no '@'.
++     _c('^[^D][^@]{2,}$'),
+      _c('^\s*(?P<addr>[^\s@]+@[^\s@]+)\s*$')),
+     # and another thehartfod.com/hartfordlife.com
+     (_c('^Your message\s*$'),
+      _c('^because:'),
+      _c('^\s*(?P<addr>[^\s@]+@[^\s@]+)\s*$')),
+-    # kviv.be (NTMail)
++    # kviv.be (InterScan NT)
+     (_c('^Unable to deliver message to'),
+      _c(r'\*+\s+End of message\s+\*+'),
+      _c('<(?P<addr>[^>]*)>')),
+@@ -127,6 +134,38 @@
+     (_c('A message that you sent could not be delivered'),
+      _c('^---'),
+      _c('(?P<addr>[^\s@]+@[^\s@)]+)')),
++    # LSMTP for Windows
++    (_c('^--> Error description:\s*$'),
++     _c('^Error-End:'),
++     _c('^Error-for:\s+(?P<addr>[^\s@]+@[^\s@]+)')),
++    # Qmail with a tri-language intro beginning in spanish
++    (_c('Your message could not be delivered'),
++     _c('^-'),
++     _c('<(?P<addr>[^>]*)>:')),
++    # socgen.com
++    (_c('Your message could not be delivered to'),
++     _c('^\s*$'),
++     _c('(?P<addr>[^\s@]+@[^\s@]+)')),
++    # dadoservice.it
++    (_c('Your message has encountered delivery problems'),
++     _c('Your message reads'),
++     _c('addressed to\s*(?P<addr>[^\s@]+@[^\s@)]+)')),
++    # gomaps.com
++    (_c('Did not reach the following recipient'),
++     _c('^\s*$'),
++     _c('\s(?P<addr>[^\s@]+@[^\s@]+)')),
++    # EYOU MTA SYSTEM
++    (_c('This is the deliver program at'),
++     _c('^-'),
++     _c('^(?P<addr>[^\s@]+@[^\s@<>]+)')),
++    # A non-standard qmail at ieo.it
++    (_c('this is the email server at'),
++     _c('^-'),
++     _c('\s(?P<addr>[^\s@]+@[^\s@]+)[\s,]')),
++    # pla.net.py (MDaemon.PRO ?)
++    (_c('- no such user here'),
++     _c('There is no user'),
++     _c('^(?P<addr>[^\s@]+@[^\s@]+)\s')),
+     # Next one goes here...
+     ]
+ 
+diff -ru mailman-2.1.9.orig/Mailman/Bouncers/SimpleWarning.py mailman-2.1.9/Mailman/Bouncers/SimpleWarning.py
+--- mailman-2.1.9.orig/Mailman/Bouncers/SimpleWarning.py	2006-03-06 13:12:36.000000000 -0500
++++ mailman-2.1.9/Mailman/Bouncers/SimpleWarning.py	2008-08-06 19:15:53.000000000 -0400
+@@ -1,17 +1,17 @@
+-# Copyright (C) 2001-2006 by the Free Software Foundation, Inc.
++# Copyright (C) 2001-2007 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+ # as published by the Free Software Foundation; either version 2
+ # of the License, or (at your option) any later version.
+-# 
++#
+ # This program is distributed in the hope that it will be useful,
+ # but WITHOUT ANY WARRANTY; without even the implied warranty of
+ # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ # GNU General Public License for more details.
+-# 
++#
+ # You should have received a copy of the GNU General Public License
+-# along with this program; if not, write to the Free Software 
++# along with this program; if not, write to the Free Software
+ # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,
+ # USA.
+ 
+@@ -37,6 +37,18 @@
+     (_c('The address to which the message has not yet been delivered is'),
+      _c('No action is required on your part'),
+      _c(r'\s*(?P<addr>\S+@\S+)\s*')),
++    # This is from MessageSwitch.  It is a kludge because the text that
++    # identifies it as a warning only comes after the address.  We can't
++    # use ecre, because it really isn't significant, so we fake it.  Once
++    # we see the start, we know it's a warning, and we're going to return
++    # Stop anyway, so we match anything for the address and end.
++    (_c('This is just a warning, you do not need to take any action'),
++     _c('.+'),
++     _c('(?P<addr>.+)')),
++    # Symantec_AntiVirus_for_SMTP_Gateways - see comments for MessageSwitch
++    (_c('Delivery attempts will continue to be made'),
++     _c('.+'),
++     _c('(?P<addr>.+)')),
+     # Next one goes here...
+     ]
+ 
+diff -ru mailman-2.1.9.orig/Mailman/Cgi/admindb.py mailman-2.1.9/Mailman/Cgi/admindb.py
+--- mailman-2.1.9.orig/Mailman/Cgi/admindb.py	2006-08-30 10:54:22.000000000 -0400
++++ mailman-2.1.9/Mailman/Cgi/admindb.py	2008-08-06 19:17:32.000000000 -0400
+@@ -1,4 +1,4 @@
+-# Copyright (C) 1998-2006 by the Free Software Foundation, Inc.
++# Copyright (C) 1998-2007 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+@@ -154,9 +154,9 @@
+         signal.signal(signal.SIGTERM, sigterm_handler)
+ 
+         realname = mlist.real_name
+-        if not cgidata.keys():
++        if not cgidata.keys() or cgidata.has_key('admlogin'):
+             # If this is not a form submission (i.e. there are no keys in the
+-            # form), then we don't need to do much special.
++            # form) or it's a login, then we don't need to do much special.
+             doc.SetTitle(_('%(realname)s Administrative Database'))
+         elif not details:
+             # This is a form submission
+@@ -172,6 +172,7 @@
+             doc.AddItem(' ')
+             doc.AddItem(Link(mlist.GetScriptURL('admindb', absolute=1),
+                              _('Click here to reload this page.')))
++            doc.AddItem("<br />")
+             doc.AddItem(mlist.GetMailmanFooter())
+             print doc.Format()
+             mlist.Save()
+@@ -190,7 +191,8 @@
+                 + ' <em>%s</em>' % mlist.real_name))
+         if details <> 'instructions':
+             form.AddItem(Center(SubmitButton('submit', _('Submit All Data'))))
+-        if not (sender or msgid):
++        nomessages = not mlist.GetHeldMessageIds()
++        if not (details or sender or msgid or nomessages):
+             form.AddItem(Center(
+                 CheckBox('discardalldefersp', 0).Format() +
+                 '&nbsp;' +
+@@ -238,7 +240,7 @@
+         if addform:
+             doc.AddItem(form)
+             form.AddItem('<hr>')
+-            if not (sender or msgid):
++            if not (details or sender or msgid or nomessages):
+                 form.AddItem(Center(
+                     CheckBox('discardalldefersp', 0).Format() +
+                     '&nbsp;' +
+@@ -382,6 +384,8 @@
+     bysender = helds_by_sender(mlist)
+     if not bysender:
+         return 0
++    form.AddItem('<hr>')
++    form.AddItem(Center(Header(2, _('Held Messages'))))
+     # Add the by-sender overview tables
+     admindburl = mlist.GetScriptURL('admindb', absolute=1)
+     table = Table(border=0)
+@@ -706,7 +710,8 @@
+             preserve = actions.get('senderpreserve', 0)
+             forward = actions.get('senderforward', 0)
+             forwardaddr = actions.get('senderforwardto', '')
+-            comment = _('No reason given')
++            #comment = _('No reason given')
++            comment = mlist.manual_rejection_notice or _('No reason given')
+             bysender = helds_by_sender(mlist)
+             for id in bysender.get(sender, []):
+                 try:
+diff -ru mailman-2.1.9.orig/Mailman/Cgi/admin.py mailman-2.1.9/Mailman/Cgi/admin.py
+--- mailman-2.1.9.orig/Mailman/Cgi/admin.py	2008-08-06 18:43:08.000000000 -0400
++++ mailman-2.1.9/Mailman/Cgi/admin.py	2008-08-06 19:17:32.000000000 -0400
+@@ -1,4 +1,4 @@
+-# Copyright (C) 1998-2006 by the Free Software Foundation, Inc.
++# Copyright (C) 1998-2007 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+@@ -41,6 +41,7 @@
+ from Mailman.UserDesc import UserDesc
+ from Mailman.htmlformat import *
+ from Mailman.Cgi import Auth
++from Mailman.Cgi.listinfo import listinfo_overview
+ from Mailman.Logging.Syslog import syslog
+ 
+ # Set up i18n
+@@ -205,8 +205,11 @@
+         mlist.Unlock()
+ 
+ 
+-
++######################################################
++####### MAYBE THIS PAGE WON'T BE SEEN ??? ############
++######################################################
+ def admin_overview(msg=''):
++    return listinfo_overview(msg)
+     # Show the administrative overview page, with the list of all the lists on
+     # this host.  msg is an optional error message to display at the top of
+     # the page.
+@@ -319,10 +321,11 @@
+         elif len(reflist) == 3:
+             category, subcat, varname = reflist
+         options = mlist.GetConfigInfo(category, subcat)
+-        for i in options:
+-            if i and i[0] == varname:
+-                item = i
+-                break
++        if options:
++            for i in options:
++                if i and i[0] == varname:
++                    item = i
++                    break
+     # Print an error message if we couldn't find a valid one
+     if not item:
+         bad = _('No valid variable name found.')
+@@ -383,7 +386,6 @@
+     adminurl = mlist.GetScriptURL('admin')
+     categories = mlist.GetConfigCategories()
+     label = _(categories[category][0])
+-
+     # Set up the document's headers
+     realname = mlist.real_name
+     doc.SetTitle(_('%(realname)s Administration (%(label)s)'))
+@@ -401,44 +403,50 @@
+                     encoding=encoding)
+     else:
+         form = Form('%s/%s' % (adminurl, category), encoding=encoding)
+-    # This holds the two columns of links
+-    linktable = Table(valign='top', width='100%')
+-    linktable.AddRow([Center(Bold(_("Configuration Categories"))),
+-                      Center(Bold(_("Other Administrative Activities")))])
+-    # The `other links' are stuff in the right column.
+-    otherlinks = UnorderedList()
+-    otherlinks.AddItem(Link(mlist.GetScriptURL('admindb'),
+-                            _('Tend to pending moderator requests')))
+-    otherlinks.AddItem(Link(mlist.GetScriptURL('listinfo'),
+-                            _('Go to the general list information page')))
+-    otherlinks.AddItem(Link(mlist.GetScriptURL('edithtml'),
+-                            _('Edit the public HTML pages and text files')))
+-    otherlinks.AddItem(Link(mlist.GetBaseArchiveURL(),
+-                            _('Go to list archives')).Format() +
+-                       '<br>&nbsp;<br>')
++    # otherlinks are basically the RIGHT COLUMN
++    otherlinks = "<b>Admin Activities</b><br /><br />"
++    otherlinks += Link(mlist.GetScriptURL('admindb'),
++                       _('Tend to moderator requests')).Format()+"<br />"
++    otherlinks += Link(mlist.GetScriptURL('edithtml'),
++                       _('Edit public HTML pages text files')).Format()+"<br />"
++    otherlinks += Link(mlist.GetScriptURL('listinfo'),
++                       _('View list-info page')).Format()+"<br />"
++    otherlinks += Link(mlist.GetBaseArchiveURL(),
++                       _('Visit list archives')).Format() + "<br /> <br />"
+     # We do not allow through-the-web deletion of the site list!
+     if mm_cfg.OWNERS_CAN_DELETE_THEIR_OWN_LISTS and \
+            mlist.internal_name() <> mm_cfg.MAILMAN_SITE_LIST:
+-        otherlinks.AddItem(Link(mlist.GetScriptURL('rmlist'),
+-                                _('Delete this mailing list')).Format() +
+-                           _(' (requires confirmation)<br>&nbsp;<br>'))
+-    otherlinks.AddItem(Link('%s/logout' % adminurl,
+-                            # BAW: What I really want is a blank line, but
+-                            # adding an &nbsp; won't do it because of the
+-                            # bullet added to the list item.
+-                            '<FONT SIZE="+2"><b>%s</b></FONT>' %
+-                            _('Logout')))
+-    # These are links to other categories and live in the left column
+-    categorylinks_1 = categorylinks = UnorderedList()
+-    categorylinks_2 = ''
++        otherlinks += Link(mlist.GetScriptURL('rmlist'),
++                           _('Delete this mailing list')).Format() + \
++                           " (requires confirmation)<br /> <br />"
++    otherlinks += Link('%s/logout' % adminurl,"<font size=+1><b>%s</b></font>" 
++                       % _('Logout')).Format()
++    ##################################################################
++    # categorylinks are the LEFT COLUMN
++    categorylinks = "<b>Admin Links</b><br /><br />"
+     categorykeys = categories.keys()
+-    half = len(categorykeys) / 2
+-    counter = 0
+     subcat = None
++    open = ""
+     for k in categorykeys:
+         label = _(categories[k][0])
+         url = '%s/%s' % (adminurl, k)
+-        if k == category:
++        # HACK TO HAVE ADVANCED OPTIONS MENU
++        if k in ['autoreply','bounce','contentfilter','language','nondigest']:
++            if k == 'autoreply':
++              categorylinks += "<a href=\"javascript:toggle('advanced')\" class=treelink> \
++                                <b>&raquo;</b> Advanced options</a> \
++                                <ul id=advanced class=tree>"
++            if k == category:
++                categorylinks += "<li>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;" \
++                             +Link(url, Bold('%s' % label)).Format() + "</li>"
++                open = "advanced"
++            else:
++                categorylinks += "<li>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;" \
++                             +Link(url, label).Format() + "</li>"
++            if k == 'nondigest':
++                categorylinks += "</ul>"
++        else:
++            headercat = k
+             # Handle subcategories
+             subcats = mlist.GetConfigSubCategories(k)
+             if subcats:
+@@ -448,38 +456,52 @@
+                         break
+                 else:
+                     # The first subcategory in the list is the default
+-                    subcat = subcats[0][0]
+-                subcat_items = []
++                    subcat = ""
++                subcat_items = ""
+                 for sub, text in subcats:
+                     if sub == subcat:
+-                        text = Bold('[%s]' % text).Format()
+-                    subcat_items.append(Link(url + '/' + sub, text))
+-                categorylinks.AddItem(
+-                    Bold(label).Format() +
+-                    UnorderedList(*subcat_items).Format())
++                        text = Bold('%s' % text).Format()
++                        open = headercat
++                    subcat_items += "<li>"+Link(url + '/' + sub, text).Format()+"</li>"
++                categorylinks += "<a href=\"javascript:toggle('"+headercat+"')\" class=treelink>"
++                categorylinks += label+"</a><br /><ul id="+headercat+" class=tree0 style=\"display:block;\">" + \
++                                 subcat_items + "</ul>"
+             else:
+-                categorylinks.AddItem(Link(url, Bold('[%s]' % label)))
+-        else:
+-            categorylinks.AddItem(Link(url, label))
+-        counter += 1
+-        if counter >= half:
+-            categorylinks_2 = categorylinks = UnorderedList()
+-            counter = -len(categorykeys)
++                if k == category:
++                    categorylinks += Link(url,Bold('%s' % label)).Format()+"<br/>"
++                else:
++                    categorylinks += Link(url, label).Format() + "<br />"
++                    
++        #else:
++        #  categorylinks += Link(url, label).Format() + "<br />"
+     # Make the emergency stop switch a rude solo light
+-    etable = Table()
+-    # Add all the links to the links table...
+-    etable.AddRow([categorylinks_1, categorylinks_2])
+-    etable.AddRowInfo(etable.GetCurrentRowIndex(), valign='top')
+     if mlist.emergency:
+-        label = _('Emergency moderation of all list traffic is enabled')
+-        etable.AddRow([Center(
+-            Link('?VARHELP=general/emergency', Bold(label)))])
+         color = mm_cfg.WEB_ERROR_COLOR
+-        etable.AddCellInfo(etable.GetCurrentRowIndex(), 0,
+-                           colspan=2, bgcolor=color)
+-    linktable.AddRow([etable, otherlinks])
+-    # ...and add the links table to the document.
+-    form.AddItem(linktable)
++        categorylinks += "<span style=\"background-color:"+color+";\">"
++        categorylinks += "<a href='?VARHELP=general/emergency'><b> \
++                    Emergency moderation of all list traffic is enabled</b></a>"
++        categorylinks += "</span>"
++    
++    # Add the two columns to a table and add this to the document
++    form.AddItem("<table width=99% align=center border=0 padding=0 margin=0> \
++                           <tr valign=top><td width=40%>"+categorylinks+"</td>")
++    form.AddItem("<td>"+otherlinks+"</td></tr></table>")
++    
++    loadfoldmenu = "<script type=text/javascript>"
++    #little trick to keeep correct branch open
++    if open != "advanced":
++        loadfoldmenu += "document.getElementById('advanced').style.display='none';"
++    if open != "members":
++        loadfoldmenu += "document.getElementById('members').style.display='none';"
++    if open != "privacy":
++        loadfoldmenu += "document.getElementById('privacy').style.display='none';"
++    loadfoldmenu += "function toggle(list){"
++    loadfoldmenu += "  var listElementStyle=document.getElementById(list).style;"
++    loadfoldmenu += "  if (listElementStyle.display=='none') listElementStyle.display='block';"
++    loadfoldmenu += "  else listElementStyle.display='none';"
++    loadfoldmenu += "}"
++    loadfoldmenu += "</script>"
++    form.AddItem(loadfoldmenu)
+     form.AddItem('<hr>')
+     form.AddItem(
+         _('''Make your changes in the following section, then submit them
+@@ -866,12 +888,7 @@
+     chunksz = mlist.admin_member_chunksize
+     # The email addresses had /better/ be ASCII, but might be encoded in the
+     # database as Unicodes.
+-    all = []
+-    for _m in mlist.getMembers():
+-        try:
+-            all.append( _m.encode() )
+-        except:
+-            all.append( _m )
++    all = [_m.encode() for _m in mlist.getMembers()]
+     all.sort(lambda x, y: cmp(x.lower(), y.lower()))
+     # See if the query has a regular expression
+     regexp = cgidata.getvalue('findmember', '').strip()
+@@ -949,7 +966,7 @@
+         for letter in digits + lowercase:
+             if not buckets.get(letter):
+                 continue
+-            url = adminurl + '/members?findmember=%s&letter=%s' %(urllib.quote(regexp) ,letter)
++            url = adminurl + '/members?letter=%s' % letter
+             if letter == bucket:
+                 show = Bold('[%s]' % letter.upper()).Format()
+             else:
+@@ -986,15 +1003,16 @@
+                   }
+     # Now populate the rows
+     for addr in members:
++        qaddr = urllib.quote(addr)
+         link = Link(mlist.GetOptionsURL(addr, obscure=1),
+                     mlist.getMemberCPAddress(addr))
+         fullname = Utils.uncanonstr(mlist.getMemberName(addr),
+                                     mlist.preferred_language)
+-        name = TextBox(addr + '_realname', fullname, size=longest).Format()
+-        cells = [Center(CheckBox(addr + '_unsub', 'off', 0).Format()),
++        name = TextBox(qaddr + '_realname', fullname, size=longest).Format()
++        cells = [Center(CheckBox(qaddr + '_unsub', 'off', 0).Format()),
+                  link.Format() + '<br>' +
+                  name +
+-                 Hidden('user', urllib.quote(addr)).Format(),
++                 Hidden('user', qaddr).Format(),
+                  ]
+         # Do the `mod' option
+         if mlist.getMemberOption(addr, mm_cfg.Moderate):
+@@ -1003,7 +1021,7 @@
+         else:
+             value = 'off'
+             checked = 0
+-        box = CheckBox('%s_mod' % addr, value, checked)
++        box = CheckBox('%s_mod' % qaddr, value, checked)
+         cells.append(Center(box).Format())
+         for opt in ('hide', 'nomail', 'ack', 'notmetoo', 'nodupes'):
+             extra = ''
+@@ -1022,23 +1040,23 @@
+             else:
+                 value = 'off'
+                 checked = 0
+-            box = CheckBox('%s_%s' % (addr, opt), value, checked)
++            box = CheckBox('%s_%s' % (qaddr, opt), value, checked)
+             cells.append(Center(box.Format() + extra))
+         # This code is less efficient than the original which did a has_key on
+         # the underlying dictionary attribute.  This version is slower and
+         # less memory efficient.  It points to a new MemberAdaptor interface
+         # method.
+         if addr in mlist.getRegularMemberKeys():
+-            cells.append(Center(CheckBox(addr + '_digest', 'off', 0).Format()))
++            cells.append(Center(CheckBox(qaddr + '_digest', 'off', 0).Format()))
+         else:
+-            cells.append(Center(CheckBox(addr + '_digest', 'on', 1).Format()))
++            cells.append(Center(CheckBox(qaddr + '_digest', 'on', 1).Format()))
+         if mlist.getMemberOption(addr, mm_cfg.OPTINFO['plain']):
+             value = 'on'
+             checked = 1
+         else:
+             value = 'off'
+             checked = 0
+-        cells.append(Center(CheckBox('%s_plain' % addr, value, checked)))
++        cells.append(Center(CheckBox('%s_plain' % qaddr, value, checked)))
+         # User's preferred language
+         langpref = mlist.getMemberLanguage(addr)
+         langs = mlist.GetAvailableLanguages()
+@@ -1047,7 +1065,7 @@
+             selected = langs.index(langpref)
+         except ValueError:
+             selected = 0
+-        cells.append(Center(SelectOptions(addr + '_language', langs,
++        cells.append(Center(SelectOptions(qaddr + '_language', langs,
+                                           langdescs, selected)).Format())
+         usertable.AddRow(cells)
+     # Add the usertable and a legend
+@@ -1431,7 +1449,8 @@
+         errors = []
+         removes = []
+         for user in users:
+-            if cgidata.has_key('%s_unsub' % user):
++            quser = urllib.quote(user)
++            if cgidata.has_key('%s_unsub' % quser):
+                 try:
+                     mlist.ApprovedDeleteMember(user, whence='member mgt page')
+                     removes.append(user)
+@@ -1442,7 +1461,7 @@
+                 doc.addError(_('Ignoring changes to deleted member: %(user)s'),
+                              tag=_('Warning: '))
+                 continue
+-            value = cgidata.has_key('%s_digest' % user)
++            value = cgidata.has_key('%s_digest' % quser)
+             try:
+                 mlist.setMemberOption(user, mm_cfg.Digests, value)
+             except (Errors.AlreadyReceivingDigests,
+@@ -1452,28 +1471,28 @@
+                 # BAW: Hmm...
+                 pass
+ 
+-            newname = cgidata.getvalue(user+'_realname', '')
++            newname = cgidata.getvalue(quser+'_realname', '')
+             newname = Utils.canonstr(newname, mlist.preferred_language)
+             mlist.setMemberName(user, newname)
+ 
+-            newlang = cgidata.getvalue(user+'_language')
++            newlang = cgidata.getvalue(quser+'_language')
+             oldlang = mlist.getMemberLanguage(user)
+             if Utils.IsLanguage(newlang) and newlang <> oldlang:
+                 mlist.setMemberLanguage(user, newlang)
+ 
+-            moderate = not not cgidata.getvalue(user+'_mod')
++            moderate = not not cgidata.getvalue(quser+'_mod')
+             mlist.setMemberOption(user, mm_cfg.Moderate, moderate)
+ 
+             # Set the `nomail' flag, but only if the user isn't already
+             # disabled (otherwise we might change BYUSER into BYADMIN).
+-            if cgidata.has_key('%s_nomail' % user):
++            if cgidata.has_key('%s_nomail' % quser):
+                 if mlist.getDeliveryStatus(user) == MemberAdaptor.ENABLED:
+                     mlist.setDeliveryStatus(user, MemberAdaptor.BYADMIN)
+             else:
+                 mlist.setDeliveryStatus(user, MemberAdaptor.ENABLED)
+             for opt in ('hide', 'ack', 'notmetoo', 'nodupes', 'plain'):
+                 opt_code = mm_cfg.OPTINFO[opt]
+-                if cgidata.has_key('%s_%s' % (user, opt)):
++                if cgidata.has_key('%s_%s' % (quser, opt)):
+                     mlist.setMemberOption(user, opt_code, 1)
+                 else:
+                     mlist.setMemberOption(user, opt_code, 0)
+diff -ru mailman-2.1.9.orig/Mailman/Cgi/Auth.py mailman-2.1.9/Mailman/Cgi/Auth.py
+--- mailman-2.1.9.orig/Mailman/Cgi/Auth.py	2005-08-26 21:40:17.000000000 -0400
++++ mailman-2.1.9/Mailman/Cgi/Auth.py	2008-08-06 19:17:32.000000000 -0400
+@@ -21,7 +21,7 @@
+ from Mailman import mm_cfg
+ from Mailman import Utils
+ from Mailman import Errors
+-from Mailman.htmlformat import FontAttr
++from Mailman.htmlformat import *
+ from Mailman.i18n import _
+ 
+ 
+@@ -55,5 +55,7 @@
+          'path'    : actionurl,
+          'message' : msg,
+          'who'     : who,
++         'HCSHeader':HCSHeader(),
+          }, mlist=mlist)
+     print mlist.GetMailmanFooter()
++
+diff -ru mailman-2.1.9.orig/Mailman/Cgi/confirm.py mailman-2.1.9/Mailman/Cgi/confirm.py
+--- mailman-2.1.9.orig/Mailman/Cgi/confirm.py	2005-12-30 13:50:08.000000000 -0500
++++ mailman-2.1.9/Mailman/Cgi/confirm.py	2008-08-06 19:17:32.000000000 -0400
+@@ -1,4 +1,4 @@
+-# Copyright (C) 2001-2005 by the Free Software Foundation, Inc.
++# Copyright (C) 2001-2008 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+@@ -529,6 +529,12 @@
+             doc.addError(_("""%(newaddr)s is banned from subscribing to the
+             %(realname)s list.  If you think this restriction is erroneous,
+             please contact the list owners at %(owneraddr)s."""))
++        except Errors.MMAlreadyAMember:
++            realname = mlist.real_name
++            bad_confirmation(doc, _("""%(newaddr)s is already a member of
++            the %(realname)s list.  It is possible that you are attempting
++            to confirm a request for an address that has already been
++            subscribed."""))
+         else:
+             # The response
+             listname = mlist.real_name
+diff -ru mailman-2.1.9.orig/Mailman/Cgi/create.py mailman-2.1.9/Mailman/Cgi/create.py
+--- mailman-2.1.9.orig/Mailman/Cgi/create.py	2006-08-30 10:54:22.000000000 -0400
++++ mailman-2.1.9/Mailman/Cgi/create.py	2008-08-06 19:17:32.000000000 -0400
+@@ -1,4 +1,4 @@
+-# Copyright (C) 2001-2006 by the Free Software Foundation, Inc.
++# Copyright (C) 2001-2007 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+@@ -392,7 +392,7 @@
+     # Create the table of initially supported languages, sorted on the long
+     # name of the language.
+     revmap = {}
+-    for key, (name, charset) in mm_cfg.LC_DESCRIPTIONS.items():
++    for key, (name, charset, direction) in mm_cfg.LC_DESCRIPTIONS.items():
+         revmap[_(name)] = key
+     langnames = revmap.keys()
+     langnames.sort()
+diff -ru mailman-2.1.9.orig/Mailman/Cgi/edithtml.py mailman-2.1.9/Mailman/Cgi/edithtml.py
+--- mailman-2.1.9.orig/Mailman/Cgi/edithtml.py	2008-08-06 18:43:08.000000000 -0400
++++ mailman-2.1.9/Mailman/Cgi/edithtml.py	2008-08-06 19:17:32.000000000 -0400
+@@ -1,4 +1,4 @@
+-# Copyright (C) 1998-2006 by the Free Software Foundation, Inc.
++# Copyright (C) 1998-2007 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+diff -ru mailman-2.1.9.orig/Mailman/Cgi/listinfo.py mailman-2.1.9/Mailman/Cgi/listinfo.py
+--- mailman-2.1.9.orig/Mailman/Cgi/listinfo.py	2005-08-26 21:40:17.000000000 -0400
++++ mailman-2.1.9/Mailman/Cgi/listinfo.py	2008-08-06 19:17:32.000000000 -0400
+@@ -70,14 +70,29 @@
+     doc = Document()
+     doc.set_language(mm_cfg.DEFAULT_SERVER_LANGUAGE)
+
+-    legend = _("%(hostname)s Mailing Lists")
+-    doc.SetTitle(legend)
+-
+-    table = Table(border=0, width="100%")
+-    table.AddRow([Center(Header(2, legend))])
+-    table.AddCellInfo(table.GetCurrentRowIndex(), 0, colspan=2,
+-                      bgcolor=mm_cfg.WEB_HEADER_COLOR)
+
++    # If list dne, dont show list of lists!
++    from string import find
++    if find(msg, "No such list") != -1:
++        doc.AddItem("<br/><br/><font color=\"red\">"+msg+"</font><br/><br/>")
++        doc.AddItem(MailmanLogo())
++        print doc.Format()
++        return
++    doc.SetTitle("HCS Public Lists Index")
++    
++    intro = "\
++    <div><center><h1>HCS Public Lists Index</h1></center>"
++    intro += "<font color=\"red\">"+msg+"</font>"
++    intro += "<h2>Welcome!</h2> \
++    <ul> \
++    <li>Click on a list name to see information and subscription options.</li> \
++    <li>Click admin to be taken to the administrative interface</li> \
++    <li>To view a private list, go to http://"+hostname+"/mailman/listinfo/LISTNAMEHERE</li> \
++    <li>To create a list, click <a href=http://www.hcs.harvard.edu/makelist>here</a>.</li> \
++    </ul></div> \
++    "
++    doc.AddItem(intro)
++    
+     # Skip any mailing lists that isn't advertised.
+     advertised = []
+     listnames = Utils.list_names()
+@@ -92,65 +107,88 @@
+                 continue
+             else:
+                 advertised.append((mlist.GetScriptURL('listinfo'),
++                                   mlist.GetScriptURL('admin'),
+                                    mlist.real_name,
+                                    Utils.websafe(mlist.description)))
+     if msg:
+         greeting = FontAttr(msg, color="ff5060", size="+1")
+     else:
+-        greeting = FontAttr(_('Welcome!'), size='+2')
++        greeting = ""
+ 
+     welcome = [greeting]
+-    mailmanlink = Link(mm_cfg.MAILMAN_URL, _('Mailman')).Format()
+     if not advertised:
+         welcome.extend(
+-            _('''<p>There currently are no publicly-advertised
+-            %(mailmanlink)s mailing lists on %(hostname)s.'''))
+-    else:
+-        welcome.append(
+-            _('''<p>Below is a listing of all the public mailing lists on
+-            %(hostname)s.  Click on a list name to get more information about
+-            the list, or to subscribe, unsubscribe, and change the preferences
+-            on your subscription.'''))
+-
+-    # set up some local variables
+-    adj = msg and _('right') or ''
+-    siteowner = Utils.get_site_email()
+-    welcome.extend(
+-        (_(''' To visit the general information page for an unadvertised list,
+-        open a URL similar to this one, but with a '/' and the %(adj)s
+-        list name appended.
+-        <p>List administrators, you can visit '''),
+-         Link(Utils.ScriptURL('admin'),
+-              _('the list admin overview page')),
+-         _(''' to find the management interface for your list.
+-         <p>If you are having trouble using the lists, please contact '''),
+-         Link('mailto:' + siteowner, siteowner),
+-         '.<p>'))
+-
+-    table.AddRow([apply(Container, welcome)])
+-    table.AddCellInfo(max(table.GetCurrentRowIndex(), 0), 0, colspan=2)
++            _('''<p>There currently are no publicly-advertised mailing lists on %(hostname)s.'''))
+ 
++    table = "<table align=center width=98% cellspacing=0 id=publiclists>"
+     if advertised:
+-        table.AddRow(['&nbsp;', '&nbsp;'])
+-        table.AddRow([Bold(FontAttr(_('List'), size='+2')),
+-                      Bold(FontAttr(_('Description'), size='+2'))
+-                      ])
+-        highlight = 1
+-        for url, real_name, description in advertised:
+-            table.AddRow(
+-                [Link(url, Bold(real_name)),
+-                      description or Italic(_('[no description available]'))])
+-            if highlight and mm_cfg.WEB_HIGHLIGHT_COLOR:
+-                table.AddRowInfo(table.GetCurrentRowIndex(),
+-                                 bgcolor=mm_cfg.WEB_HIGHLIGHT_COLOR)
+-            highlight = not highlight
+-
++       table += "<tr class=first><td>List</td><td>Description</td></tr>"
++       highlight = 0
++       for url, admin_url, real_name, description in advertised:
++           if highlight:
++               table += "<tr class=shaded>"
++           else:
++               table += "<tr class=unshaded>"
++           table += "<td class=gray><a href="+url+"><b>"+real_name+"</b></a> &nbsp;"
++           table += "(<a href="+admin_url+" class=admin>admin</a>)</td>"
++           table += "<td>"+description+"&nbsp;</td></tr>"
++           highlight = not highlight
++    table += "</table>"
+     doc.AddItem(table)
+-    doc.AddItem('<hr>')
++
++    doc.AddItem('<br />')
+     doc.AddItem(MailmanLogo())
+     print doc.Format()
+ 
+ 
++
++
++
++
++def MemberOptionsStuff():
++    # Get listname and mlist
++    parts = Utils.GetPathPieces()
++    listname = parts[0].lower()
++    try:
++        mlist = MailList.MailList(listname, lock=0)
++    except Errors.MMListError, e:
++        # Avoid cross-site scripting attacks
++        safelistname = Utils.websafe(listname)
++        title = _('CGI script error')
++        doc.SetTitle(title)
++        doc.AddItem(Header(2, title))
++        doc.addError(_('No such list <em>%(safelistname)s</em>'))
++        doc.AddItem('<hr>')
++        doc.AddItem(MailmanLogo())
++        print doc.Format()
++        syslog('error', 'No such list "%s": %s\n', listname, e)
++        return
++    
++    actionurl = mlist.GetScriptURL('options')
++    t = "<b>Edit my subscription options</b><br />"
++    t += "<form action="+actionurl+" method=POST>"
++    t += "<input name=language type=HIDDEN value=en />"
++    t += "<table border=0 cellspacing=2 cellpadding=2 width=100%><tr><td width=50%>"
++    t += "Email: </td><td><input type=text name=email size=30 /></td></tr>"
++    t += "<tr><td>Password: </td>"
++    t += "<td><input type=password name=password size=30 /></td></tr></table>"
++    t += "<center><button type=submit name=login>Log in</button></center>"
++    t += "</form>"
++    
++    t += "<br />"
++    
++    t += "<b>Password reminder, Unsubscribe</b><br />"
++    t += "<ul style=\"margin-top:0; margin-bottom:0;\"><li>Click Remind to be emailed your password.</li>"
++    t += "<li>When you click unsubscribe, you will emailed a confirmation link which you need to click</li></ul>"
++    t += "<form action="+actionurl+" method=POST>"
++    t += "<input name=language type=HIDDEN value=en />"
++    t += "Email: <input type=text name=email size=30 />"
++    t += "<button type=submit name=login-remind>Remind</button>"
++    t += "<button type=submit name=login-unsub>Unsubscribe</button>"
++    t += "</form>"
++    return t
++
++
+ 
+ def list_listinfo(mlist, lang):
+     # Generate list specific listinfo
+@@ -198,6 +230,8 @@
+     replacements['<mm-displang-box>'] = displang
+     replacements['<mm-lang-form-start>'] = mlist.FormatFormStart('listinfo')
+     replacements['<mm-fullname-box>'] = mlist.FormatBox('fullname', size=30)
++    replacements['<mm-member-options-stuff>'] = MemberOptionsStuff()
++    replacements['<mm-admin-link>'] = mlist.GetScriptURL('admin')
+ 
+     # Do the expansion.
+     doc.AddItem(mlist.ParseTags('listinfo.html', replacements, lang))
+Only in mailman-2.1.9/Mailman/Cgi: Makefile
+diff -ru mailman-2.1.9.orig/Mailman/Cgi/options.py mailman-2.1.9/Mailman/Cgi/options.py
+--- mailman-2.1.9.orig/Mailman/Cgi/options.py	2006-08-30 10:54:22.000000000 -0400
++++ mailman-2.1.9/Mailman/Cgi/options.py	2008-08-06 19:17:32.000000000 -0400
+@@ -1,4 +1,4 @@
+-# Copyright (C) 1998-2006 by the Free Software Foundation, Inc.
++# Copyright (C) 1998-2008 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+@@ -99,9 +99,11 @@
+         user = cgidata.getvalue('email')
+         if not user:
+             # If we're coming from the listinfo page and we left the email
+-            # address field blank, it's not an error.  listinfo.html names the
+-            # button UserOptions; we can use that as the descriminator.
+-            if not cgidata.getvalue('UserOptions'):
++            # address field blank, it's not an error.  Likewise if we're
++            # coming from anywhere else. Only issue the error if we came
++            # via one of our buttons.
++            if (cgidata.getvalue('login') or cgidata.getvalue('login-unsub')
++                    or cgidata.getvalue('login-remind')):
+                 doc.addError(_('No address given'))
+             loginpage(mlist, doc, None, language)
+             print doc.Format()
+@@ -419,6 +421,14 @@
+         return
+ 
+     if cgidata.has_key('changepw'):
++        # Is this list admin and is list admin allowed to change passwords.
++        if not (is_user_or_siteadmin
++                or mm_cfg.OWNERS_CAN_CHANGE_MEMBER_PASSWORDS):
++            doc.addError(_("""The list administrator may not change the
++                    password for a user."""))
++            options_page(mlist, doc, user, cpuser, userlang)
++            print doc.Format()
++            return
+         newpw = cgidata.getvalue('newpw')
+         confirmpw = cgidata.getvalue('confpw')
+         if not newpw or not confirmpw:
+@@ -797,6 +807,8 @@
+     if mlist.topics:
+         table = Table(border="0")
+         for name, pattern, description, emptyflag in mlist.topics:
++            if emptyflag:
++                continue
+             quotedname = urllib.quote_plus(name)
+             details = Link(mlist.GetScriptURL('options') +
+                            '/%s/?VARHELP=%s' % (user, quotedname),
+@@ -859,6 +871,7 @@
+     # Preamble
+     # Set up the login page
+     form = Form(actionurl)
++    form.AddItem(Hidden('language', lang))
+     table = Table(width='100%', border=0, cellspacing=4, cellpadding=5)
+     table.AddRow([_("""In order to change your membership option, you must
+     first log in by giving your %(extra)smembership password in the section
+diff -ru mailman-2.1.9.orig/Mailman/Cgi/private.py mailman-2.1.9/Mailman/Cgi/private.py
+--- mailman-2.1.9.orig/Mailman/Cgi/private.py 2006-08-30 10:54:22.000000000 -0400
++++ mailman-2.1.9/Mailman/Cgi/private.py  2009-05-07 12:06:47.000000000 -0400
+@@ -154,6 +154,7 @@
+             {'action'  : Utils.websafe(action),
+              'realname': mlist.real_name,
+              'message' : message,
++             'HCSHeader': HCSHeader(),
+              }, mlist=mlist)
+         return
+ 
+diff -ru mailman-2.1.9.orig/Mailman/Cgi/roster.py mailman-2.1.9/Mailman/Cgi/roster.py
+--- mailman-2.1.9.orig/Mailman/Cgi/roster.py	2005-08-26 21:40:17.000000000 -0400
++++ mailman-2.1.9/Mailman/Cgi/roster.py	2008-08-06 19:17:32.000000000 -0400
+@@ -1,4 +1,4 @@
+-# Copyright (C) 1998-2003 by the Free Software Foundation, Inc.
++# Copyright (C) 1998-2007 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+@@ -71,13 +71,17 @@
+     # "admin"-only, then we try to cookie authenticate the user, and failing
+     # that, we check roster-email and roster-pw fields for a valid password.
+     # (also allowed: the list moderator, the list admin, and the site admin).
++    password = cgidata.getvalue('roster-pw', '')
++    list_hidden = mlist.WebAuthenticate((mm_cfg.AuthListModerator,
++                                         mm_cfg.AuthListAdmin,
++                                         mm_cfg.AuthSiteAdmin),
++                                        password)
+     if mlist.private_roster == 0:
+         # No privacy
+         ok = 1
+     elif mlist.private_roster == 1:
+         # Members only
+         addr = cgidata.getvalue('roster-email', '')
+-        password = cgidata.getvalue('roster-pw', '')
+         ok = mlist.WebAuthenticate((mm_cfg.AuthUser,
+                                     mm_cfg.AuthListModerator,
+                                     mm_cfg.AuthListAdmin,
+@@ -85,7 +89,6 @@
+                                    password, addr)
+     else:
+         # Admin only, so we can ignore the address field
+-        password = cgidata.getvalue('roster-pw', '')
+         ok = mlist.WebAuthenticate((mm_cfg.AuthListModerator,
+                                     mm_cfg.AuthListAdmin,
+                                     mm_cfg.AuthSiteAdmin),
+@@ -103,7 +106,7 @@
+     doc = HeadlessDocument()
+     doc.set_language(lang)
+ 
+-    replacements = mlist.GetAllReplacements(lang)
++    replacements = mlist.GetAllReplacements(lang, list_hidden)
+     replacements['<mm-displang-box>'] = mlist.FormatButton(
+         'displang-button',
+         text = _('View this page in'))
+diff -ru mailman-2.1.9.orig/Mailman/Gui/Archive.py mailman-2.1.9/Mailman/Gui/Archive.py
+--- mailman-2.1.9.orig/Mailman/Gui/Archive.py	2005-08-26 21:40:17.000000000 -0400
++++ mailman-2.1.9/Mailman/Gui/Archive.py	2008-08-06 19:14:19.000000000 -0400
+@@ -22,7 +22,7 @@
+ 
+ class Archive(GUIBase):
+     def GetConfigCategory(self):
+-        return 'archive', _('Archiving Options')
++        return 'archive', _('Archiving options')
+ 
+     def GetConfigInfo(self, mlist, category, subcat=None):
+         if category <> 'archive':
+diff -ru mailman-2.1.9.orig/Mailman/Gui/General.py mailman-2.1.9/Mailman/Gui/General.py
+--- mailman-2.1.9.orig/Mailman/Gui/General.py	2008-08-06 18:43:08.000000000 -0400
++++ mailman-2.1.9/Mailman/Gui/General.py	2008-08-06 19:14:19.000000000 -0400
+@@ -31,7 +31,7 @@
+ 
+ class General(GUIBase):
+     def GetConfigCategory(self):
+-        return 'general', _('General Options')
++        return 'general', _('General options')
+ 
+     def GetConfigInfo(self, mlist, category, subcat):
+         if category <> 'general':
+@@ -436,21 +436,18 @@
+             # Convert any html entities to Unicode
+             mlist.subject_prefix = Utils.canonstr(
+                 val, mlist.preferred_language)
+-        elif property == 'info':
+-            if val <> mlist.info:
+-                if Utils.suspiciousHTML(val):
+-                    doc.addError(_("""The <b>info</b> attribute you saved
+-contains suspicious HTML that could potentially expose your users to cross-site
+-scripting attacks.  This change has therefore been rejected.  If you still want
+-to make these changes, you must have shell access to your Mailman server.
+-This change can be made with bin/withlist or with bin/config_list by setting
+-mlist.info.
+-                        """))
+-                else:
+-                    mlist.info = val
+         else:
+             GUIBase._setValue(self, mlist, property, val, doc)
+ 
++    def _escape(self, property, value):
++        # The 'info' property allows HTML, but let's sanitize it to avoid XSS
++        # exploits.  Everything else should be fully escaped.
++        if property <> 'info':
++            return GUIBase._escape(self, property, value)
++        # Sanitize <script> and </script> tags but nothing else.  Not the best
++        # solution, but expedient.
++        return re.sub(r'(?i)<([/]?script.*?)>', r'&lt;\1&gt;', value)
++
+     def _postValidate(self, mlist, doc):
+         if not mlist.reply_to_address.strip() and \
+                mlist.reply_goes_to_list == 2:
+Only in mailman-2.1.9/Mailman/Gui: Makefile
+diff -ru mailman-2.1.9.orig/Mailman/Gui/Membership.py mailman-2.1.9/Mailman/Gui/Membership.py
+--- mailman-2.1.9.orig/Mailman/Gui/Membership.py	2005-08-26 21:40:17.000000000 -0400
++++ mailman-2.1.9/Mailman/Gui/Membership.py	2008-08-06 19:14:19.000000000 -0400
+@@ -23,7 +23,7 @@
+ 
+ class Membership:
+     def GetConfigCategory(self):
+-        return 'members', _('Membership&nbsp;Management...')
++        return 'members', _('<b>&raquo; </b>Membership options')
+ 
+     def GetConfigSubCategories(self, category):
+         if category == 'members':
+diff -ru mailman-2.1.9.orig/Mailman/Gui/NonDigest.py mailman-2.1.9/Mailman/Gui/NonDigest.py
+--- mailman-2.1.9.orig/Mailman/Gui/NonDigest.py	2005-08-26 21:40:17.000000000 -0400
++++ mailman-2.1.9/Mailman/Gui/NonDigest.py	2008-08-06 19:14:19.000000000 -0400
+@@ -1,4 +1,4 @@
+-# Copyright (C) 2001-2003 by the Free Software Foundation, Inc.
++# Copyright (C) 2001-2007 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+@@ -12,7 +12,8 @@
+ #
+ # You should have received a copy of the GNU General Public License
+ # along with this program; if not, write to the Free Software
+-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
++# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,
++# USA.
+ 
+ """GUI component for managing the non-digest delivery options.
+ """
+@@ -31,7 +32,7 @@
+ 
+ class NonDigest(GUIBase):
+     def GetConfigCategory(self):
+-        return 'nondigest', _('Non-digest&nbsp;options')
++        return 'nondigest', _('Non-digest options')
+ 
+     def GetConfigInfo(self, mlist, category, subcat=None):
+         if category <> 'nondigest':
+diff -ru mailman-2.1.9.orig/Mailman/Gui/Privacy.py mailman-2.1.9/Mailman/Gui/Privacy.py
+--- mailman-2.1.9.orig/Mailman/Gui/Privacy.py	2005-12-30 13:50:08.000000000 -0500
++++ mailman-2.1.9/Mailman/Gui/Privacy.py	2008-08-06 19:14:19.000000000 -0400
+@@ -34,7 +34,7 @@
+ 
+ class Privacy(GUIBase):
+     def GetConfigCategory(self):
+-        return 'privacy', _('Privacy options...')
++        return 'privacy', _('<b>&raquo; </b>Privacy options')
+ 
+     def GetConfigSubCategories(self, category):
+         if category == 'privacy':
+@@ -137,6 +137,15 @@
+              to this mailing list, with no further moderation required.  Add 
+              addresses one per line; start the line with a ^ character to
+              designate a regular expression match.""")),
++             
++            _('Auto approve list'),
++            ('auto_approve_list', mm_cfg.EmailListEx, (10, WIDTH), 1,
++             _("""List of addresses which are automatically approved
++             for membership (only affects lists which require approval)"""),
++
++             _("""Addresses in this list are automatically approved for
++             membership in a mailing list without subscription confirmation
++             emails.""")),
+ 
+             _("Membership exposure"),
+             ('private_roster', mm_cfg.Radio,
+@@ -241,10 +250,17 @@
+              _("""List of non-member addresses whose postings should be
+              automatically accepted."""),
+ 
++             # XXX Needs to be reviewed for list@domain names.  Also, the
++             # implementation allows the @listname to work in all
++             # *_these_nonmembers. It doesn't make much sense in the others,
++             # but it could be useful. Should we mention it?
+              _("""Postings from any of these non-members will be automatically
+              accepted with no further moderation applied.  Add member
+              addresses one per line; start the line with a ^ character to
+-             designate a regular expression match.""")),
++             designate a regular expression match.  A line consisting of
++             the @ character followed by a list name specifies another
++             Mailman list in this installation, all of whose member
++             addresses will be accepted for this list.""")),
+ 
+             ('hold_these_nonmembers', mm_cfg.EmailListEx, (10, WIDTH), 1,
+              _("""List of non-member addresses whose postings will be
+diff -ru mailman-2.1.9.orig/Mailman/htmlformat.py mailman-2.1.9/Mailman/htmlformat.py
+--- mailman-2.1.9.orig/Mailman/htmlformat.py	2008-08-06 18:43:08.000000000 -0400
++++ mailman-2.1.9/Mailman/htmlformat.py	2008-08-06 19:22:19.000000000 -0400
+@@ -1,4 +1,4 @@
+-# Copyright (C) 1998-2006 by the Free Software Foundation, Inc.
++# Copyright (C) 1998-2007 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+@@ -298,16 +298,16 @@
+ 
+     def Format(self, indent=0, **kws):
+         charset = 'us-ascii'
+-        if self.language and Utils.IsLanguage(self.language):
++        if self.language:
+             charset = Utils.GetCharSet(self.language)
+-        output = ['Content-Type: text/html; charset=%s' % charset]
+-        output.append('Cache-control: no-cache\n')
++        output = ['Content-Type: text/html; charset=%s\n' % charset]
++        output.append('<link rel="stylesheet" href="/static/hcs.css" />')
+         if not self.suppress_head:
+             kws.setdefault('bgcolor', self.bgcolor)
+             tab = ' ' * indent
+             output.extend([tab,
+-                           '<HTML>',
+-                           '<HEAD>'
++                           '<html>',
++                           '<head>'
+                            ])
+             if mm_cfg.IMAGE_LOGOS:
+                 output.append('<LINK REL="SHORTCUT ICON" HREF="%s">' %
+@@ -316,7 +316,7 @@
+             output.append('<META http-equiv="Content-Type" '
+                           'content="text/html; charset=%s">' % charset)
+             if self.title:
+-                output.append('%s<TITLE>%s</TITLE>' % (tab, self.title))
++                output.append('%s<title>%s</title>' % (tab, self.title))
+             output.append('%s</HEAD>' % tab)
+             quals = []
+             # Default link colors
+@@ -329,6 +329,7 @@
+             for k, v in kws.items():
+                 quals.append('%s="%s"' % (k, v))
+             output.append('%s<BODY %s>' % (tab, SPACE.join(quals)))
++            output.append(HCSHeader())
+         # Always do this...
+         output.append(Container.Format(self, indent))
+         if not self.suppress_head:
+@@ -430,13 +434,17 @@
+         self.kws = kws
+ 
+     def Format(self, indent=0):
+-        output = ['<INPUT name="%s" type="%s" value="%s"' %
++        output = ['<input name="%s" type="%s" value="%s"' %
+                   (self.name, self.type, self.value)]
++        if self.type == "SUBMIT":
++            #output.append('class=btn')
++            output = ['<button type="submit" name="%s" value="%s">%s</button>' % (self.name, self.value, self.value)]
+         for item in self.kws.items():
+             output.append('%s="%s"' % item)
+         if self.checked:
+             output.append('CHECKED')
+-        output.append('>')
++        if self.type != "SUBMIT":
++            output.append('>')
+         return SPACE.join(output)
+ 
+ 
+@@ -617,29 +625,32 @@
+ PYTHON_POWERED = 'PythonPowered.png'
+ GNU_HEAD = 'gnu-head-tiny.jpg'
+ 
+-
+ def MailmanLogo():
+-    t = Table(border=0, width='100%')
+-    if mm_cfg.IMAGE_LOGOS:
+-        def logo(file):
+-            return mm_cfg.IMAGE_LOGOS + file
+-        mmlink = '<img src="%s" alt="Delivered by Mailman" border=0>' \
+-                 '<br>version %s' % (logo(DELIVERED_BY), mm_cfg.VERSION)
+-        pylink = '<img src="%s" alt="Python Powered" border=0>' % \
+-                 logo(PYTHON_POWERED)
+-        gnulink = '<img src="%s" alt="GNU\'s Not Unix" border=0>' % \
+-                  logo(GNU_HEAD)
+-        t.AddRow([mmlink, pylink, gnulink])
+-    else:
+-        # use only textual links
+-        version = mm_cfg.VERSION
+-        mmlink = Link(MAILMAN_URL,
+-                      _('Delivered by Mailman<br>version %(version)s'))
+-        pylink = Link(PYTHON_URL, _('Python Powered'))
+-        gnulink = Link(GNU_URL, _("Gnu's Not Unix"))
+-        t.AddRow([mmlink, pylink, gnulink])
++    t = "<table width=98% border=0 cellspacing=0 cellpadding=0 align=center><tr>"
++    t += "<td width=33% class=credits align=left>"
++    t += "Powered by <a href=http://www.list.org class=credits>Mailman</a>.</font>"
++    t += "</td><td width=34% class=credits align=center>"
++    t += "Copyright &#169; 2008-10 <a href=http://www.hcs.harvard.edu class=credits>Harvard Computer Society</a>"
++    t += "</td><td width=33% class=credits align=right>"
++    t += "Questions? Contact "
++    t += "<script type=text/javascript><!-- \n"
++    t += "emailaddress=('acctserv@'+'hcs.harvard.edu'); document.write('<a href=mailto:' + emailaddress + ' class=credits>acctserv</a>'); //--></script>"
++    t += ".</td></tr></table>"
+     return t
+ 
++def HCSHeader():
++    t = "<table width=100% border=0 cellspacing=0 cellpadding=0>"
++    t += "<tr height=3 bgcolor=660000><td></td><td></td><td></td></tr>"
++    t += "<tr height=27 align=left>"
++    t += "<td width=8 bgcolor=660000></td>"
++    t += "<td width=42 rowspan=3 valign=bottom background=https://www.hcs.harvard.edu/static/hcs.png></td>"
++    t += "<td valign=middle bgcolor=660000>"
++    t += "&nbsp;<a href=/mailman/listinfo class=title>HCS MAILING LISTS</a>"
++    t += "</td></tr>"
++    t += "<tr height=6 bgcolor=990000><td></td><td></td><td></td></tr>"
++    t += "<tr height=15 bgcolor=white><td></td><td></td><td></td></tr>"
++    t += "</table>"
++    return t
+ 
+ class SelectOptions:
+    def __init__(self, varname, values, legend,
+diff -ru mailman-2.1.9.orig/Mailman/HTMLFormatter.py mailman-2.1.9/Mailman/HTMLFormatter.py
+--- mailman-2.1.9.orig/Mailman/HTMLFormatter.py	2006-08-30 10:54:22.000000000 -0400
++++ mailman-2.1.9/Mailman/HTMLFormatter.py	2008-08-06 19:22:24.000000000 -0400
+@@ -1,4 +1,4 @@
+-# Copyright (C) 1998-2006 by the Free Software Foundation, Inc.
++# Copyright (C) 1998-2008 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+@@ -46,37 +46,28 @@
+         listinfo_link  = Link(self.GetScriptURL('listinfo'), realname).Format()
+         owner_link = Link('mailto:' + self.GetOwnerEmail(), ownertext).Format()
+         innertext = _('%(listinfo_link)s list run by %(owner_link)s')
+-        return Container(
+-            '<hr>',
+-            Address(
+-                Container(
+-                   innertext,
+-                    '<br>',
+-                    Link(self.GetScriptURL('admin'),
+-                         _('%(realname)s administrative interface')),
+-                    _(' (requires authorization)'),
+-                    '<br>',
+-                    Link(Utils.ScriptURL('listinfo'),
+-                         _('Overview of all %(hostname)s mailing lists')),
+-                    '<p>', MailmanLogo()))).Format()
++        
++        footer = "<br /><table class=footer cellspacing=0 cellpadding=10 width=98% align=center><tr><td class=footer>"
++        footer += "<a href="+self.GetScriptURL('listinfo')+">"+realname+"</a> list run by "+"<a href=mailto:"+self.GetOwnerEmail()+">"+ownertext+"</a>"
++        footer += "<br /><a href="+self.GetScriptURL('admin')+">"+realname+" admin interface</a> (requires authorization)"
++        footer += "<br /><a href=http://"+hostname+"/mailman/listinfo>Public lists index</a>"
++        footer += "</td></tr></table>"
++        footer += "<p>"+MailmanLogo()+"</p>"
++        return footer
+ 
+-    def FormatUsers(self, digest, lang=None):
++    def FormatUsers(self, digest, lang=None, list_hidden=False):
+         if lang is None:
+             lang = self.preferred_language
+         conceal_sub = mm_cfg.ConcealSubscription
+         people = []
+         if digest:
+-            digestmembers = self.getDigestMemberKeys()
+-            for dm in digestmembers:
+-                if not self.getMemberOption(dm, conceal_sub):
+-                    people.append(dm)
+-            num_concealed = len(digestmembers) - len(people)
++            members = self.getDigestMemberKeys()
+         else:
+             members = self.getRegularMemberKeys()
+-            for m in members:
+-                if not self.getMemberOption(m, conceal_sub):
+-                    people.append(m)
+-            num_concealed = len(members) - len(people)
++        for m in members:
++            if list_hidden or not self.getMemberOption(m, conceal_sub):
++                people.append(m)
++        num_concealed = len(members) - len(people)
+         if num_concealed == 1:
+             concealed = _('<em>(1 private member not shown)</em>')
+         elif num_concealed > 1:
+@@ -303,14 +294,14 @@
+             container.AddItem(
+                 self.RestrictedListMessage(_('The subscribers list'),
+                                            self.private_roster)
+-                              + _(" <p>Enter your ")
++                              + _(" <!--<p>Enter your ")
+                               + whom[:-1].lower()
+                               + _(" and password to visit"
+-                              "  the subscribers list: <p><center> ")
+-                              + whom
++                              "  the subscribers list:--><p><center> ")
++                              + "Email: "
+                               + " ")
+             container.AddItem(self.FormatBox('roster-email'))
+-            container.AddItem(_("Password: ")
++            container.AddItem(_("&nbsp;&nbsp;Password: ")
+                               + self.FormatSecureBox('roster-pw')
+                               + "&nbsp;&nbsp;")
+             container.AddItem(SubmitButton('SubscriberRoster',
+@@ -324,27 +315,28 @@
+             full_url = "%s/%s" % (base_url, extra)
+         else:
+             full_url = base_url
+-        return ('<FORM Method=POST ACTION="%s">' % full_url)
++        return ('<form method=POST ACTION="%s">' % full_url)
+ 
+     def FormatArchiveAnchor(self):
+         return '<a href="%s">' % self.GetBaseArchiveURL()
+ 
+     def FormatFormEnd(self):
+-        return '</FORM>'
++        return '</form>'
+ 
+     def FormatBox(self, name, size=20, value=''):
+         if isinstance(value, str):
+             safevalue = Utils.websafe(value)
+         else:
+             safevalue = value
+-        return '<INPUT type="Text" name="%s" size="%d" value="%s">' % (
++        return '<input type="Text" name="%s" size="%d" value="%s">' % (
+             name, size, safevalue)
+ 
+     def FormatSecureBox(self, name):
+-        return '<INPUT type="Password" name="%s" size="15">' % name
++        return '<input type="Password" name="%s" size="15">' % name
+ 
+     def FormatButton(self, name, text='Submit'):
+-        return '<INPUT type="Submit" name="%s" value="%s">' % (name, text)
++        #return '<input type="Submit" class=btn name="%s" value="%s">' % (name, text)
++        return '<button type="submit" name="%s" value="%s">%s</button>' % (name, text, text)
+ 
+     def FormatReminder(self, lang):
+         if self.send_reminders:
+@@ -385,6 +377,7 @@
+             listlangs = self.GetLangSelectBox(lang).Format()
+         d = {
+             '<mm-mailman-footer>' : self.GetMailmanFooter(),
++            '<mm-hcs-header>' : HCSHeader(),
+             '<mm-list-name>' : self.real_name,
+             '<mm-email-user>' : self._internal_name,
+             '<mm-list-description>' : Utils.websafe(self.description),
+@@ -411,7 +404,7 @@
+             d['<mm-favicon>'] = mm_cfg.IMAGE_LOGOS + mm_cfg.SHORTCUT_ICON
+         return d
+ 
+-    def GetAllReplacements(self, lang=None):
++    def GetAllReplacements(self, lang=None, list_hidden=False):
+         """
+         returns standard replaces plus formatted user lists in
+         a dict just like GetStandardReplacements.
+@@ -419,8 +412,8 @@
+         if lang is None:
+             lang = self.preferred_language
+         d = self.GetStandardReplacements(lang)
+-        d.update({"<mm-regular-users>": self.FormatUsers(0, lang),
+-                  "<mm-digest-users>": self.FormatUsers(1, lang)})
++        d.update({"<mm-regular-users>": self.FormatUsers(0, lang, list_hidden),
++                  "<mm-digest-users>": self.FormatUsers(1, lang, list_hidden)})
+         return d
+ 
+     def GetLangSelectBox(self, lang=None, varname='language'):
+diff -ru mailman-2.1.9.orig/Mailman/MailList.py mailman-2.1.9/Mailman/MailList.py
+--- mailman-2.1.9.orig/Mailman/MailList.py	2006-03-11 21:24:53.000000000 -0500
++++ mailman-2.1.9/Mailman/MailList.py	2008-08-06 19:22:31.000000000 -0400
+@@ -383,6 +383,7 @@
+         # 2==Discard
+         self.member_moderation_action = 0
+         self.member_moderation_notice = ''
++        self.manual_rejection_notice = ''
+         self.accept_these_nonmembers = []
+         self.hold_these_nonmembers = []
+         self.reject_these_nonmembers = []
+@@ -392,6 +393,8 @@
+         self.nonmember_rejection_notice = ''
+         # Ban lists
+         self.ban_list = []
++        # Auto approve list
++        self.auto_approve_list = []
+         # BAW: This should really be set in SecurityManager.InitVars()
+         self.password = crypted_password
+         # Max autoresponses per day.  A mapping between addresses and a
+@@ -906,12 +909,15 @@
+                    self.internal_name(), who, by)
+             raise Errors.MMSubscribeNeedsConfirmation
+         else:
+-            # Subscription approval is required.  Add this entry to the admin
+-            # requests database.  BAW: this should probably take a userdesc
+-            # just like above.
+-            self.HoldSubscription(email, name, password, digest, lang)
+-            raise Errors.MMNeedApproval, _(
+-                'subscriptions to %(realname)s require moderator approval')
++            if email in self.auto_approve_list:
++                self.ApprovedAddMember(userdesc, whence=remote or '')
++            else:
++                # Subscription approval is required.  Add this entry to the admin
++                # requests database.  BAW: this should probably take a userdesc
++                # just like above.
++                self.HoldSubscription(email, name, password, digest, lang)
++                raise Errors.MMNeedApproval, _(
++                    'subscriptions to %(realname)s require moderator approval')
+ 
+     def ApprovedAddMember(self, userdesc, ack=None, admin_notif=None, text='',
+                           whence=''):
+@@ -1196,10 +1202,11 @@
+                     self.SendHostileSubscriptionNotice(invitation, addr)
+                     raise Errors.HostileSubscriptionError
+             elif self.subscribe_policy in (2, 3):
+-                self.HoldSubscription(addr, fullname, password, digest, lang)
+-                name = self.real_name
+-                raise Errors.MMNeedApproval, _(
+-                    'subscriptions to %(name)s require administrator approval')
++                if addr not in self.auto_approve_list:
++                    self.HoldSubscription(addr, fullname, password, digest, lang)
++                    name = self.real_name
++                    raise Errors.MMNeedApproval, _(
++                        'subscriptions to %(name)s require administrator approval')
+             self.ApprovedAddMember(userdesc, whence=whence)
+             return op, addr, password, digest, lang
+         elif op == Pending.UNSUBSCRIPTION:
+diff -ru mailman-2.1.9.orig/Mailman/mm_cfg.py.dist.in mailman-2.1.9/Mailman/mm_cfg.py.dist.in
+--- mailman-2.1.9.orig/Mailman/mm_cfg.py.dist.in	2005-08-26 21:40:17.000000000 -0400
++++ mailman-2.1.9/Mailman/mm_cfg.py.dist.in	2008-08-06 19:22:42.000000000 -0400
+@@ -42,3 +42,71 @@
+ 
+ ##################################################
+ # Put YOUR site-specific settings below this line.
++ADMIN_CATEGORIES = [
++    # First column
++    'archive', 'digest', 'general', 'members', 'passwords', 'privacy',
++    # Useless links
++    'autoreply', 'bounce', 'contentfilter', 'language', 'nondigest'
++]
++WEB_ADMINITEM_COLOR = '#edf3fe'
++WEB_HEADER_COLOR = '#3d80df'
++WEB_ADMINPW_COLOR = '#edf3fe'
++
++#-------------------------------------------------------------
++# The name of the list Mailman uses to send password reminders
++# and similar. Don't change if you want mailman-owner to be
++# a valid local part.
++MAILMAN_SITE_LIST = 'mailman'
++
++#-------------------------------------------------------------
++# If you change these, you have to configure your http server
++# accordingly (Alias and ScriptAlias directives in most httpds)
++DEFAULT_URL_PATTERN = 'http://%s/mailman'
++PRIVATE_ARCHIVE_URL = '/mailman/private'
++IMAGE_LOGOS         = '/images/mailman/'
++
++#-------------------------------------------------------------
++# Default domain for email addresses of newly created MLs
++DEFAULT_EMAIL_HOST = 'lists.hcs.harvard.edu'
++#-------------------------------------------------------------
++# Default host for web interface of newly created MLs
++DEFAULT_URL_HOST   = 'lists.hcs.harvard.edu'
++#-------------------------------------------------------------
++# Required when setting any of its arguments.
++add_virtualhost(DEFAULT_URL_HOST, DEFAULT_EMAIL_HOST)
++
++#-------------------------------------------------------------
++# The default language for this server.
++DEFAULT_SERVER_LANGUAGE = 'en'
++
++#-------------------------------------------------------------
++# Iirc this was used in pre 2.1, leave it for now
++USE_ENVELOPE_SENDER    = 0              # Still used?
++
++#-------------------------------------------------------------
++# Unset send_reminders on newly created lists
++DEFAULT_SEND_REMINDERS = 0
++
++#-------------------------------------------------------------
++# Uncomment this if you configured your MTA such that it
++# automatically recognizes newly created lists.
++# (see /usr/share/doc/mailman/README.{EXIM,...})
++# MTA=None   # Misnomer, suppresses alias output on newlist
++
++#-------------------------------------------------------------
++# Uncomment if you use Postfix virtual domains, but be sure to
++# read /usr/share/doc/mailman/README.POSTFIX first.
++MTA='Postfix'
++
++# Note - if you're looking for something that is imported from mm_cfg, but you
++# didn't find it above, it's probably in /usr/lib/mailman/Mailman/Defaults.py.
++ALLOW_OPEN_SUBSCRIBE='Yes'
++
++#HCS: This allows people to download the raw format
++PUBLIC_MBOX='Yes'
++
++###############################################################
++#THESE ARE ALL THE HCS OPTIONS - IF OTHERS ARE ADDED AT INSTALL
++#IT SHOULD BE FINE TO DELETE THEM (BELOW THIS) I THINK...
++###############################################################
++
+diff -ru mailman-2.1.9.orig/Mailman/OldStyleMemberships.py mailman-2.1.9/Mailman/OldStyleMemberships.py
+--- mailman-2.1.9.orig/Mailman/OldStyleMemberships.py	2005-08-26 21:40:17.000000000 -0400
++++ mailman-2.1.9/Mailman/OldStyleMemberships.py	2008-08-06 19:22:48.000000000 -0400
+@@ -1,4 +1,4 @@
+-# Copyright (C) 2001-2003 by the Free Software Foundation, Inc.
++# Copyright (C) 2001-2007 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+@@ -12,7 +12,8 @@
+ #
+ # You should have received a copy of the GNU General Public License
+ # along with this program; if not, write to the Free Software
+-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
++# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,
++# USA.
+ 
+ """Old style Mailman membership adaptor.
+ 
+@@ -201,7 +202,7 @@
+             value = 0
+         else:
+             value = member
+-            member = member.lower()
++        member = member.lower()
+         if digest:
+             self.__mlist.digest_members[member] = value
+         else:
+@@ -243,6 +244,8 @@
+         password = self.__mlist.passwords.get(memberkey,
+                                               Utils.MakeRandomPassword())
+         lang = self.getMemberLanguage(memberkey)
++        delivery = self.__mlist.delivery_status.get(member.lower(),
++                                              (MemberAdaptor.ENABLED,0))
+         # First, possibly delete the old member
+         if not nodelete:
+             self.removeMember(memberkey)
+@@ -252,6 +255,11 @@
+         # Set the entire options bitfield
+         if flags:
+             self.__mlist.user_options[newaddress.lower()] = flags
++        # If this is a straightforward address change, i.e. nodelete = 0,
++        # preserve the delivery status and time if BYUSER or BYADMIN
++        if delivery[0] in (MemberAdaptor.BYUSER, MemberAdaptor.BYADMIN)\
++          and not nodelete:
++            self.__mlist.delivery_status[newaddress.lower()] = delivery
+ 
+     def setMemberPassword(self, memberkey, password):
+         assert self.__mlist.Locked()
+diff -ru mailman-2.1.9.orig/Mailman/Utils.py mailman-2.1.9/Mailman/Utils.py
+--- mailman-2.1.9.orig/Mailman/Utils.py	2008-08-06 18:43:08.000000000 -0400
++++ mailman-2.1.9/Mailman/Utils.py	2008-08-06 19:22:52.000000000 -0400
+@@ -1,4 +1,4 @@
+-# Copyright (C) 1998-2006 by the Free Software Foundation, Inc.
++# Copyright (C) 1998-2007 by the Free Software Foundation, Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License
+@@ -574,7 +574,7 @@
+     'set':         (3, 3),
+     'subscribe':   (0, 3),
+     'unsubscribe': (0, 1),
+-    'who':         (0, 0),
++    'who':         (0, 2),
+     }
+ 
+ # Given a Message.Message object, test for administrivia (eg subscribe,
+diff -ru mailman-2.1.9.orig/Makefile.in mailman-2.1.9/Makefile.in
+--- mailman-2.1.9.orig/Makefile.in	2008-08-06 18:43:08.000000000 -0400
++++ mailman-2.1.9/Makefile.in	2008-08-06 18:56:57.000000000 -0400
+@@ -46,7 +46,7 @@
+ 	archives/private archives/public
+ 
+ ARCH_INDEP_DIRS= \
+-	bin templates scripts cron pythonlib \
++	bin templates scripts cron pythonlib static \
+ 	Mailman Mailman/Cgi Mailman/Logging Mailman/Archiver \
+ 	Mailman/Handlers Mailman/Queue Mailman/Bouncers	 \
+ 	Mailman/MTA Mailman/Gui Mailman/Commands messages icons \
+@@ -55,7 +55,7 @@
+ ARCH_DEP_DIRS=	cgi-bin mail
+ 
+ # Directories make should decend into
+-SUBDIRS=	bin cron misc Mailman scripts src templates messages tests
++SUBDIRS=	bin cron misc Mailman scripts src templates messages tests static
+ 
+ 
+ # Modes for directories and executables created by the install
+Only in mailman-2.1.9: static
+diff -ru mailman-2.1.9.orig/templates/en/admlogin.html mailman-2.1.9/templates/en/admlogin.html
+--- mailman-2.1.9.orig/templates/en/admlogin.html	2008-08-06 18:43:08.000000000 -0400
++++ mailman-2.1.9/templates/en/admlogin.html	2008-08-06 19:07:21.000000000 -0400
+@@ -1,40 +1,23 @@
+ <html>
+ <head>
+   <title>%(listname)s %(who)s Authentication</title>
+-<script>function sf(){document.f.adminpw.focus();}</script>
++  <link rel=stylesheet href=/static/hcs.css>
+ </head>
+-<body bgcolor="#ffffff" onLoad="sf()">
+-<FORM METHOD=POST ACTION="%(path)s" name="f">
++<body>
++%(HCSHeader)s
+ %(message)s
+-  <TABLE WIDTH="100%%" BORDER="0" CELLSPACING="4" CELLPADDING="5">
+-    <TR>
+-      <TD COLSPAN="2" WIDTH="100%%" BGCOLOR="#99CCFF" ALIGN="CENTER">
+-	<B><FONT COLOR="#000000" SIZE="+1">%(listname)s %(who)s
+-	    Authentication</FONT></B>
+-      </TD>
+-    </TR>
+-    <tr>
+-      <TD><div ALIGN="Right">List %(who)s Password:</div></TD>
+-      <TD><INPUT TYPE="password" NAME="adminpw" SIZE="30"></TD>
+-    </tr>
+-    <tr>
+-      <td colspan=2 align=middle><INPUT type="SUBMIT"
+-                                        name="admlogin"
+-					value="Let me in...">
+-      </td>
+-    </tr>
+-  </TABLE>
+-      <p><strong><em>Important:</em></strong> From this point on, you
+-      must have cookies enabled in your browser, otherwise no
+-      administrative changes will take effect.
+-
+-      <p>Session cookies are used in Mailman's
+-      administrative interface so that you don't need to
+-      re-authenticate with every administrative operation.  This
+-      cookie will expire automatically when you exit your browser, or
+-      you can explicitly expire the cookie by hitting the
+-      <em>Logout</em> link under <em>Other Administrative
+-      Activities</em> (which you'll see once you successfully log in).
+-</FORM>
++<div>
++<center><h1>%(listname)s %(who)s Authentication</h1></center>
++<FORM METHOD=POST ACTION="%(path)s">
++<center>List %(who)s Password: <INPUT TYPE="password" NAME="adminpw" SIZE="30">
++<button type=submit name=admlogin>Let me in...</button>
++</center></form>
++<center><a href="http://www.hcs.harvard.edu/reset-password">Reset
++administrator password</a></center>
++<br />
++<p><strong><em>Important:</em></strong> From this point on, you
++must have cookies enabled in your browser, otherwise no
++administrative changes will take effect.
++</div>
+ </body>
+ </html>
+diff -ru mailman-2.1.9.orig/templates/en/archidxhead.html mailman-2.1.9/templates/en/archidxhead.html
+--- mailman-2.1.9.orig/templates/en/archidxhead.html	2002-11-18 16:04:57.000000000 -0500
++++ mailman-2.1.9/templates/en/archidxhead.html	2008-08-06 19:07:21.000000000 -0400
+@@ -4,6 +4,7 @@
+      <title>The %(listname)s %(archive)s Archive by %(archtype)s</title>
+      <META NAME="robots" CONTENT="noindex,follow">
+      %(encoding)s
++     <link rel="stylesheet" href="/static/hcs.css">
+   </HEAD>
+   <BODY BGCOLOR="#ffffff">
+       <a name="start"></A>
+diff -ru mailman-2.1.9.orig/templates/en/archtoc.html mailman-2.1.9/templates/en/archtoc.html
+--- mailman-2.1.9.orig/templates/en/archtoc.html	2002-11-18 16:04:57.000000000 -0500
++++ mailman-2.1.9/templates/en/archtoc.html	2008-08-06 19:07:21.000000000 -0400
+@@ -3,13 +3,14 @@
+   <HEAD>
+      <title>The %(listname)s Archives</title>
+      <META NAME="robots" CONTENT="noindex,follow">
++     <link rel="stylesheet" href="/static/hcs.css">
+      %(meta)s
+   </HEAD>
+-  <BODY BGCOLOR="#ffffff">
+-     <h1>The %(listname)s Archives </h1>
++  <BODY>
++     <center><h1>The %(listname)s Archives </h1></center>
+      <p>
+-      You can get <a href="%(listinfo)s">more information about this list</a>
+-      or you can <a href="%(fullarch)s">download the full raw archive</a>
++      Get <a href="%(listinfo)s">more information about this list</a>
++      or <a href="%(fullarch)s">download the full raw archive</a>
+       (%(size)s).
+      </p>
+      %(noarchive_msg)s
+diff -ru mailman-2.1.9.orig/templates/en/emptyarchive.html mailman-2.1.9/templates/en/emptyarchive.html
+--- mailman-2.1.9.orig/templates/en/emptyarchive.html	2002-01-03 23:13:28.000000000 -0500
++++ mailman-2.1.9/templates/en/emptyarchive.html	2008-08-06 19:07:21.000000000 -0400
+@@ -3,8 +3,10 @@
+   <HEAD>
+      <title>The %(listname)s Archives</title>
+      <META NAME="robots" CONTENT="noindex,follow">
++     <link rel="stylesheet" href="/static/hcs.css">
+   </HEAD>
+   <BODY BGCOLOR="#ffffff">
++     %(HCSHeader)s
+      <h1>The %(listname)s Archives </h1>
+      <p>
+       No messages have been posted to this list yet, so the archives are
+diff -ru mailman-2.1.9.orig/templates/en/listinfo.html mailman-2.1.9/templates/en/listinfo.html
+--- mailman-2.1.9.orig/templates/en/listinfo.html	2008-08-06 18:43:08.000000000 -0400
++++ mailman-2.1.9/templates/en/listinfo.html	2008-08-06 19:07:21.000000000 -0400
+@@ -1,144 +1,75 @@
+ <!-- $Revision: 5865 $ -->
+-<HTML>
+-  <HEAD>
+-    <TITLE><MM-List-Name> Info Page</TITLE>
++<html>
++<head>
++<title><MM-List-Name> Info</title>
++</head>
++<body>
++  <MM-HCS-HEADER>
++  <div>
++    <br/>
++    <h1 class=title style="display:inline;"><MM-List-Name></h1>
++    <a href="<MM-admin-link>" class="admin">[admin]</a><br/>
++    <h2 class=desc><MM-List-Description></h2>
++    <h2 class=desc><MM-Num-Members> members</h2>
++    <a href="mailto:<MM-Posting-Addr>"><MM-Posting-Addr></a>
++    <h2 class=heading>About</h2>
++    <MM-List-Info>
++    <h2 class=heading>Archives</h2>
++    Visit the archives <MM-Archive>here</MM-Archive>. <MM-Restricted-List-Message>
++    <h2 class=heading>Subscription</h2>
++  </div>
+   
+-  </HEAD>
+-  <BODY>
+-
+-    <P>
+-      <TABLE COLS="1" BORDER="0" CELLSPACING="4" CELLPADDING="5">
+-	<TR>
+-	  <TD COLSPAN="2" WIDTH="100%" BGCOLOR="#99CCFF" ALIGN="CENTER">
+-	    <B><FONT COLOR="#000000" SIZE="+1"><MM-List-Name> --
+-	<MM-List-Description></FONT></B>
+-	  </TD>
+-	</TR>
+-	<tr>
+-	    <td colspan="2">
+-	      <p>&nbsp;
+-	    </td>
+-	  </tr>
+-	  <tr>
+-	    <TD COLSPAN="1" WIDTH="100%" BGCOLOR="#FFF0D0">
+-	      <B><FONT COLOR="#000000">About <MM-List-Name></FONT></B>
+-	    </TD>
+-            <TD COLSPAN="1" WIDTH="100%" BGCOLOR="#FFF0D0">
+-              <MM-lang-form-start><MM-displang-box> <MM-list-langs>
+-              <MM-form-end>
+-    <MM-Subscribe-Form-Start>
+-            </TD>
+-	  </TR>
+-	    <tr>
+-	      <td colspan="2">
+-		<P><MM-List-Info></P>
+-	  <p> To see the collection of prior postings to the list,
+-	      visit the <MM-Archive><MM-List-Name>
+-		  Archives</MM-Archive>.
+-	      <MM-Restricted-List-Message>
+-	  </p>
+-	</TD>
+-      </TR>
+-      <TR>
+-	<TD COLSPAN="2" WIDTH="100%" BGCOLOR="#FFF0D0">
+-	  <B><FONT COLOR="#000000">Using <MM-List-Name></FONT></B>
+-	</TD>
+-      </TR>
+-      <tr>
+-	<td colspan="2">
+-	  To post a message to all the list members, send email to
+-	  <A HREF="mailto:<MM-Posting-Addr>"><MM-Posting-Addr></A>.
+-
+-	  <p>You can subscribe to the list, or change your existing
+-	    subscription, in the sections below.
+-	</td>
+-      </tr>
+-      <TR>
+-	<TD COLSPAN="2" WIDTH="100%" BGCOLOR="#FFF0D0">
+-	  <B><FONT COLOR="#000000">Subscribing to <MM-List-Name></FONT></B>
+-	</TD>
+-      </TR>
+-      <tr>
+-	<td colspan="2">
+-	  <P>
+-	    Subscribe to <MM-List-Name> by filling out the following
+-	      form.
+-	  <ul>
+-	  <MM-List-Subscription-Msg>
+-	      <TABLE BORDER="0" CELLSPACING="2" CELLPADDING="2"
+-		WIDTH="70%" HEIGHT= "112">
+-		<TR>
+-		  <TD BGCOLOR="#dddddd" WIDTH="55%">Your email address:</TD>
+-		  <TD WIDTH="33%"><MM-Subscribe-Box>
+-	</TD>
+-	<TD WIDTH="12%">&nbsp;</TD></TR>
+-      <tr>
+-        <td bgcolor="#dddddd" width="55%">Your name (optional):</td>
+-        <td width="33%"><mm-fullname-box></td>
+-	<TD WIDTH="12%">&nbsp;</TD></TR>
+-      <TR>
+-	<TD COLSPAN="3"><FONT SIZE=-1>You may enter a
+-	    privacy password below. This provides only mild security,
+-	    but should prevent others from messing with your
+-	    subscription.  <b>Do not use a valuable password</b> as
+-	    it will occasionally be emailed back to you in cleartext.
+-
+-            <p>If you choose not to enter a password, one will be
+-            automatically generated for you, and it will be sent to
+-            you once you've confirmed your subscription.  You can
+-            always request a mail-back of your password when you edit
+-            your personal options.
+-	    <MM-Reminder>
+-	</TD>
+-      </TR>  
+-      <TR>
+-	<TD BGCOLOR="#dddddd">Pick a password:</TD>
+-	<TD><MM-New-Password-Box></TD>
+-	<TD>&nbsp;</TD></TR>
+-      <TR> 
+-	<TD BGCOLOR="#dddddd">Reenter password to confirm:</TD>
+-	<TD><MM-Confirm-Password></TD>
+-	<TD>&nbsp; </TD></TR>
+-      <tr>
+-        <TD BGCOLOR="#dddddd">Which language do you prefer to display your messages?</TD> 
+-        <TD> <MM-list-langs></TD>
+-        <TD>&nbsp; </TD></TR>
+-      <mm-digest-question-start>
+-      <tr>
+-	<td>Would you like to receive list mail batched in a daily
+-	  digest?
+-	  </td>
+-	<td><MM-Undigest-Radio-Button> No
+-	    <MM-Digest-Radio-Button>  Yes
+-	</TD>
+-      </tr>
+-      <mm-digest-question-end>
+-      <tr>
+-	<td colspan="3">
+-	  <center><MM-Subscribe-Button></P></center>
+-    </TABLE>
+-    <MM-Form-End>
+-    </ul>
+-    </td>
+-    </tr>
+-    <TR>
+-      <TD COLSPAN="2" WIDTH="100%" BGCOLOR="#FFF0D0">
+-	<a name="subscribers">
+-        <B><FONT COLOR="#000000"><MM-List-Name> Subscribers</FONT></B></a>
+-      </TD>
+-    </TR>
+-    <tr>
+-      <TD COLSPAN="2" WIDTH="100%">
+-	<MM-Roster-Form-Start>
+-	<MM-Roster-Option>
+-	    <MM-Form-End>
+-	  <p>
+-	<MM-Options-Form-Start>
+-	<MM-Editing-Options>
+-		<MM-Form-End>
++  <table id=publiclists border="0" cellspacing=0 cellpadding=4 width=98% align=center>
++    <tr class=first align=center><td width=50%>Subscribe</td><td>Edit membership options</td></tr>
++    <tr class=unshaded>
++      <td><MM-List-Subscription-Msg>
++        <MM-Subscribe-Form-Start>
++        <table border=0 cellspacing=2 cellpadding=2>
++          <tr>
++            <td width=50%>Email:</td>
++            <td width=50%><MM-Subscribe-Box></td>
++          </tr>
++          <tr>
++            <td>Name (optional):</td>
++            <td><mm-fullname-box></td>
++          </tr>
++          <tr>
++            <td colspan=2>You may enter a privacy password 
++            below. <b>Do not use a valuable password</b> as it will be emailed
++            back to you in cleartext. If you don't enter a password, one will be
++            auto-generated and sent to you once you've confirmed your subscription.
++            <MM-Reminder></td>
++          </tr>
++          <tr>
++            <td>Password:</td>
++            <td><MM-New-Password-Box></td>
++          </tr>
++          <tr> 
++            <td>Re-type password:</td>
++            <td><MM-Confirm-Password></td>
++          </tr>
++          <mm-digest-question-start>
++          <tr>
++            <td>Would you like to receive list mail batched in a daily digest?</td>
++            <td><MM-Undigest-Radio-Button>No<MM-Digest-Radio-Button>Yes</td>
++          </tr>
++          <mm-digest-question-end>
++        </table>
++        <center><MM-Subscribe-Button></center>
++        <MM-Form-End>
++      </td>
++      <td><b>View subscriber list</b>
++        <MM-Roster-Form-Start>
++          <MM-Roster-Option>
++        <MM-Form-End>
++        <p>
++        <MM-Options-Form-Start>
++          <MM-Member-Options-Stuff>
++          <!--<MM-Editing-Options>-->
++        <MM-Form-End>  
+       </td>
+     </tr>
+-  </table>
+-<MM-Mailman-Footer>
+-</BODY>
+-</HTML>
++  </table>  
++  <MM-Mailman-Footer>
++</body>
++</html>
+diff -ru mailman-2.1.9.orig/templates/en/private.html mailman-2.1.9/templates/en/private.html
+--- mailman-2.1.9.orig/templates/en/private	2008-08-06 17:28:54.000000000 -0400
++++ mailman-2.1.9/templates/en/private.html	2008-08-06 19:07:21.000000000 -0400
+@@ -1,18 +1,14 @@
+ <html>
+ <head>
+-    <title>%(realname)s Private Archives Authentication</title>
+-<script>function sf(){document.f.adminpw.focus();}</script>
++  <title>%(realname)s Private Archives Authentication</title>
++  <link rel=stylesheet href=/static/hcs.css>
+ </head>
+-<body bgcolor="#ffffff" onLoad="sf()">
++<body>
+ <FORM METHOD=POST ACTION="%(action)s">
++%(HCSHeader)s
+ %(message)s
++<center><h2>%(realname)s Private Archives Authentication</h2></center>
+   <TABLE WIDTH="100%%" BORDER="0" CELLSPACING="4" CELLPADDING="5">
+-    <TR>
+-      <TD COLSPAN="2" WIDTH="100%%" BGCOLOR="#99CCFF" ALIGN="CENTER">
+-	<B><FONT COLOR="#000000" SIZE="+1">%(realname)s Private
+-	    Archives Authentication</FONT></B>
+-      </TD>
+-    </TR>
+     <tr>
+         <TD><div ALIGN="Right">Email address:</div></TD>
+         <TD><INPUT TYPE="text" NAME="username" SIZE="30"></TD>
+@@ -22,23 +18,13 @@
+       <TD><INPUT TYPE="password" NAME="password" SIZE="30"></TD>
+     </tr>
+     <tr>
+-      <td colspan=2 align="middle"><INPUT type="SUBMIT"
+-                                          name="submit"
+-					  value="Let me in...">
++      <td colspan=2 align="middle"><button type="submit" name="submit" value="Let me in...">Let me in...</button>
+       </td>
+     </tr>
+   </TABLE>
+       <p><strong><em>Important:</em></strong> From this point on, you
+       must have cookies enabled in your browser, otherwise
+       you will have to re-authenticate with every operation.
+-
+-      <p>Session cookies are used in Mailman's
+-      private archive interface so that you don't need to
+-      re-authenticate with every operation.  This
+-      cookie will expire automatically when you exit your browser, or
+-      you can explicitly expire the cookie by visiting your
+-      member options page and clicking the
+-      <em>Log out</em> button.
+ </FORM>
+ </body>
+ </html>
+diff -ru mailman-2.1.9.orig/templates/en/roster.html mailman-2.1.9/templates/en/roster.html
+--- mailman-2.1.9.orig/templates/en/roster.html	2001-05-18 17:28:54.000000000 -0400
++++ mailman-2.1.9/templates/en/roster.html	2008-08-06 19:07:21.000000000 -0400
+@@ -4,50 +4,36 @@
+     <TITLE><MM-List-Name> Subscribers</TITLE>
+   
+   </HEAD>
+-  <BODY BGCOLOR="#ffffff">
+-
++  <BODY>
++  <MM-HCS-HEADER>
++  <center><p><h1><MM-List-Name> Subscribers</h1></p>
++  <P>Click on your address to visit your subscription options page.<br />
++  <I>(Parenthesized entries have list delivery disabled.)</I></P></center>
+     <P>
+-    <TABLE WIDTH="100%" COLS="1" BORDER="0" CELLSPACING="4" CELLPADDING="5">
+-      <TR>
+-	<TD COLSPAN="2" WIDTH="100%" BGCOLOR="#99CCFF" ALIGN="CENTER">
+-	  <B><FONT COLOR="#000000" SIZE="+1"><MM-List-Name>
+-		Subscribers</FONT></B>
+-	</TD>
++    <TABLE id=publiclists WIDTH=98% BORDER=0 CELLSPACING=0 CELLPADDING=2 align=center>
++      <TR class=first>
++      <TD BGCOLOR=#3d80df WIDTH=50%>
++      <center>
++        <B><MM-Num-Reg-Users>
++          Non-digested Members of <MM-List-Name></B>
++      </center>
++    </TD>
++    <TD BGCOLOR=#3d80df WIDTH=50%>
++      <center>
++        <B><MM-Num-Digesters> Digested
++          Members of <MM-List-Name></B>
++      </center>
++    </TD>
+       </TR>
+-      <TR>
+-	<TD COLSPAN="2" WIDTH="100%" ALIGN="CENTER">
+-	    
+-          <P align = "right"> <MM-lang-form-start><MM-displang-box>
+-                       <MM-list-langs><MM-form-end></p>        
+-
+-	  <P>Click on your address to visit your subscription
+-	      options page.<br><I>(Parenthesized entries have list delivery 
+-	      disabled.)</I></P>
+-	</TD>
+-      </TR>
+-      <TR WIDTH="100%" VALIGN="top">
+-	<TD BGCOLOR="#FFF0D0" WIDTH="50%">
+-	  <center>
+-	    <B><FONT COLOR="#000000"><MM-Num-Reg-Users>
+-		  Non-digested Members of <MM-List-Name>:</FONT></B>
+-	  </center>
+-	</TD>
+-	<TD BGCOLOR="#FFF0D0" WIDTH="50%">
+-	  <center>
+-	    <B><FONT COLOR="#000000"><MM-Num-Digesters> Digested
+-		  Members of <MM-List-Name>:</FONT></B> 
+-	  </center>
+-	</TD>
+-      </TR>
+-      <TR VALIGN="top">
+-	<td>
+-	  <P><MM-Regular-Users>
+-	</td>
+-	<td>
+-	  <P><MM-Digest-Users>
+-	</td>
++      <TR VALIGN="top" class=unshaded>
++    <td>
++      <P><MM-Regular-Users>
++    </td>
++    <td>
++      <P><MM-Digest-Users>
++    </td>
+       </tr>
+     </table>
+ <MM-Mailman-Footer>
+ </BODY>
+-</HTML>
++</HTML>
+\ No newline at end of file
